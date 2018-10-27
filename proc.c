@@ -227,9 +227,17 @@ fork(void)
 void
 exit(void)
 {
+  exit2(0);
+}
+
+void
+exit2(int status)
+{
   struct proc *curproc = myproc();
   struct proc *p;
   int fd;
+
+  curproc->exit_status = status;
 
   if(curproc == initproc)
     panic("init exiting");
@@ -272,6 +280,12 @@ exit(void)
 int
 wait(void)
 {
+  return wait2(0);
+}
+
+int
+wait(int *status)
+{
   struct proc *p;
   int havekids, pid;
   struct proc *curproc = myproc();
@@ -286,6 +300,8 @@ wait(void)
       havekids = 1;
       if(p->state == ZOMBIE){
         // Found one.
+        if (status != NULL)
+          *status = p->exit_status;
         pid = p->pid;
         kfree(p->kstack);
         p->kstack = 0;
@@ -311,6 +327,58 @@ wait(void)
   }
 }
 
+int
+waitpid(int pid, int *status, int options)
+{
+  struct proc *p;
+  int foundproc;
+  struct proc *curproc = myproc();
+  
+  acquire(&ptable.lock);
+  for(;;){
+    // Scan through table looking for exited children.
+    foundproc = 0;
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+      if(p->pid != pid)
+        continue;
+      foundproc = 1;
+      if(p->state == ZOMBIE){
+        // Found one.
+        if (status != NULL)
+          *status = p->exit_status;
+        pid = p->pid;
+        kfree(p->kstack);
+        p->kstack = 0;
+        freevm(p->pgdir);
+        p->pid = 0;
+        p->parent = 0;
+        p->name[0] = 0;
+        p->killed = 0;
+        p->state = UNUSED;
+        release(&ptable.lock);
+        return pid;
+      }
+    }
+
+    // No point waiting if we don't have any children.
+    if(!foundproc || curproc->killed){
+      release(&ptable.lock);
+      return -1;
+    }
+
+    // Wait for children to exit.  (See wakeup1 call in proc_exit.)
+    sleep(curproc, &ptable.lock);  //DOC: wait-sleep
+  }
+}
+
+int
+setpriority(int priority)
+{
+  struct proc *curproc = myproc();
+  curproc->priority = priority;
+  return 0;
+}
+
 //PAGEBREAK: 42
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
@@ -323,6 +391,7 @@ void
 scheduler(void)
 {
   struct proc *p;
+  struct proc *hp; // process with highest priority
   struct cpu *c = mycpu();
   c->proc = 0;
   
@@ -332,27 +401,26 @@ scheduler(void)
 
     // Loop over process table looking for process to run.
     acquire(&ptable.lock);
-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->state != RUNNABLE)
-        continue;
-
-      // Switch to chosen process.  It is the process's job
-      // to release ptable.lock and then reacquire it
-      // before jumping back to us.
-      c->proc = p;
-      switchuvm(p);
-      p->state = RUNNING;
-
-      swtch(&(c->scheduler), p->context);
-      switchkvm();
-
-      // Process is done running for now.
-      // It should have changed its p->state before coming back.
-      c->proc = 0;
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
+      if(p->state == RUNNABLE && p->priority < hp->priority) {
+        hp = p;
+      }
     }
     release(&ptable.lock);
+    // Switch to chosen process.  It is the process's job
+    // to release ptable.lock and then reacquire it
+    // before jumping back to us.
+    c->proc = p;
+    switchuvm(p);
+    p->state = RUNNING;
 
-  }
+    swtch(&(c->scheduler), p->context);
+    switchkvm();
+
+    // Process is done running for now.
+    // It should have changed its p->state before coming back.
+    c->proc = 0;
+  
 }
 
 // Enter scheduler.  Must hold only ptable.lock
